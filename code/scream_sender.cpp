@@ -658,6 +658,8 @@ int main(int argc, char* argv[]) {
 	if (argc <= 1) {
 		cerr << "SCReAM V2 BW test tool, sender. Ericsson AB. Version 2026-03-04 " << endl;
 		cerr << "Usage : " << endl << " > scream_bw_test_tx <options> decoder_ip decoder_port " << endl;
+		cerr << "         or, with -wait : scream_bw_test_tx <options> -wait decoder_port" << endl;
+		cerr << "         (the receiver's IP/port are then auto-detected from the trigger packet)" << endl;
 		cerr << "     -if name                 Bind to specific interface" << endl;
 		cerr << "     -ipv6                    IPv6" << endl;
 		cerr << "     -time val                Run for time seconds (default infinite)" << endl;
@@ -668,7 +670,9 @@ int main(int argc, char* argv[]) {
 		cerr << "     -pushtraffic             just pushtraffic at a fixed bitrate, no feedback needed" << endl;
 		cerr << "                                must be used with -fixedrate option" << endl;
 		cerr << "     -wait                    Wait for a trigger packet from the receiver before" << endl;
-		cerr << "                                starting transmission (iperf-style rendezvous)" << endl;
+		cerr << "                                starting transmission (iperf-style rendezvous)." << endl;
+		cerr << "                                When set, the decoder_ip argument may be omitted;" << endl;
+		cerr << "                                the receiver's IP/port are taken from the trigger." << endl;
 		cerr << "     -key val1 val2           Set a given key frame interval [s] and size multiplier " << endl;
 		cerr << "                               example -key 2.0 5.0 " << endl;
 		cerr << "     -rand val                Framesizes vary randomly around the nominal " << endl;
@@ -965,8 +969,27 @@ int main(int argc, char* argv[]) {
 	}
 	if (minRate > initRate)
 		initRate = minRate;
-	DECODER_IP = argv[ix];ix++;
-	DECODER_PORT = atoi(argv[ix]);ix++;
+	/*
+	 * Positional args:
+	 *   default                 : <decoder_ip> <decoder_port>
+	 *   with -wait              : <decoder_port>            (ip auto-detected from trigger)
+	 *                             or <decoder_ip> <decoder_port> (ip is then a hint only and
+	 *                             will be overwritten by the trigger packet's source address)
+	 */
+	int remainingPositional = argc - ix;
+	if (waitForTrigger && remainingPositional == 1) {
+		DECODER_PORT = atoi(argv[ix]); ix++;
+		DECODER_IP = "0.0.0.0"; // placeholder, overwritten when trigger arrives
+	}
+	else if (remainingPositional >= 2) {
+		DECODER_IP = argv[ix]; ix++;
+		DECODER_PORT = atoi(argv[ix]); ix++;
+	}
+	else {
+		cerr << "Error: missing positional arguments." << endl;
+		cerr << "       expected <decoder_ip> <decoder_port>, or with -wait just <decoder_port>." << endl;
+		return -1;
+	}
 
 	if (setup() == 0)
 		return 0;
@@ -995,19 +1018,46 @@ int main(int argc, char* argv[]) {
 	 * keepalive immediately after binding (and again every 500 ms), so any
 	 * stock receiver works as a trigger. The trigger packet is consumed here
 	 * and never forwarded to the RTCP feedback handler.
+	 *
+	 * The trigger's source address is captured and used as the decoder
+	 * destination, so the user does not need to know (or pass on the command
+	 * line) the receiver's NAT-translated address - we simply reply to wherever
+	 * the trigger came from. This works through NAT, port-restricted firewalls,
+	 * etc., as long as the receiver can reach us first.
 	 */
 	if (waitForTrigger) {
 		cerr << "Waiting for trigger from receiver on UDP/" << DECODER_PORT << " ..." << endl;
 		char trig[64];
+		struct sockaddr_storage trigSrc;
 		while (!stopThread) {
-			ssize_t r = recvfrom(fd_outgoing_rtp, trig, sizeof(trig), 0, NULL, NULL);
+			socklen_t slen = sizeof(trigSrc);
+			ssize_t r = recvfrom(fd_outgoing_rtp, trig, sizeof(trig), 0,
+			                     (struct sockaddr*)&trigSrc, &slen);
 			if (r >= 1) break;
 		}
 		if (stopThread) {
 			cerr << "Interrupted while waiting for trigger." << endl;
 			return 0;
 		}
-		cerr << "Trigger received, starting transmission." << endl;
+
+		char ipstr[INET6_ADDRSTRLEN] = {0};
+		int srcPort = 0;
+		if (trigSrc.ss_family == AF_INET) {
+			struct sockaddr_in* sin = (struct sockaddr_in*)&trigSrc;
+			inet_ntop(AF_INET, &sin->sin_addr, ipstr, sizeof(ipstr));
+			srcPort = ntohs(sin->sin_port);
+			outgoing_rtp_addr = *sin;
+			addrlen_outgoing_rtp = sizeof(outgoing_rtp_addr);
+		}
+		else if (trigSrc.ss_family == AF_INET6) {
+			struct sockaddr_in6* sin6 = (struct sockaddr_in6*)&trigSrc;
+			inet_ntop(AF_INET6, &sin6->sin6_addr, ipstr, sizeof(ipstr));
+			srcPort = ntohs(sin6->sin6_port);
+			outgoing_rtp_addr6 = *sin6;
+			addrlen_outgoing_rtp = sizeof(outgoing_rtp_addr6);
+		}
+		cerr << "Trigger received from " << ipstr << ":" << srcPort
+		     << " - using as decoder address. Starting transmission." << endl;
 	}
 
 	/* Create RTP thread */
