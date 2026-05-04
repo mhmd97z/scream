@@ -59,6 +59,7 @@ bool isBurst = false;
 float burstStartTime = -1.0;
 float burstSleepTime = -1.0;
 bool pushTraffic = false;
+bool waitForTrigger = false;
 float maxWindowHeadroom = 5.0f;
 bool relaxedPacing = false;
 float packetPacingHeadroom = 1.5f;
@@ -666,6 +667,8 @@ int main(int argc, char* argv[]) {
 		cerr << "     -fixedrate val           Set a fixed 'coder' bitrate " << endl;
 		cerr << "     -pushtraffic             just pushtraffic at a fixed bitrate, no feedback needed" << endl;
 		cerr << "                                must be used with -fixedrate option" << endl;
+		cerr << "     -wait                    Wait for a trigger packet from the receiver before" << endl;
+		cerr << "                                starting transmission (iperf-style rendezvous)" << endl;
 		cerr << "     -key val1 val2           Set a given key frame interval [s] and size multiplier " << endl;
 		cerr << "                               example -key 2.0 5.0 " << endl;
 		cerr << "     -rand val                Framesizes vary randomly around the nominal " << endl;
@@ -898,6 +901,11 @@ int main(int argc, char* argv[]) {
 			ix++;
 			continue;
 		}
+		if (strstr(argv[ix], "-wait")) {
+			waitForTrigger = true;
+			ix++;
+			continue;
+		}
 		if (strstr(argv[ix], "-clockdrift")) {
 			enableClockDriftCompensation = true;
 			ix++;
@@ -980,6 +988,27 @@ int main(int argc, char* argv[]) {
 	pthread_mutex_init(&lock_scream, NULL);
 	pthread_mutex_init(&lock_rtp_queue, NULL);
 	pthread_mutex_init(&lock_pace, NULL);
+
+	/*
+	 * Optional rendezvous: block until the receiver sends any datagram to our
+	 * RTCP socket. The stock scream_bw_test_rx already sends a 1-byte NAT
+	 * keepalive immediately after binding (and again every 500 ms), so any
+	 * stock receiver works as a trigger. The trigger packet is consumed here
+	 * and never forwarded to the RTCP feedback handler.
+	 */
+	if (waitForTrigger) {
+		cerr << "Waiting for trigger from receiver on UDP/" << DECODER_PORT << " ..." << endl;
+		char trig[64];
+		while (!stopThread) {
+			ssize_t r = recvfrom(fd_outgoing_rtp, trig, sizeof(trig), 0, NULL, NULL);
+			if (r >= 1) break;
+		}
+		if (stopThread) {
+			cerr << "Interrupted while waiting for trigger." << endl;
+			return 0;
+		}
+		cerr << "Trigger received, starting transmission." << endl;
+	}
 
 	/* Create RTP thread */
 	pthread_create(&create_rtp_thread, NULL, createRtpThread, (void*)"Create RTP thread...");
