@@ -11,6 +11,7 @@
 class RtpQueueIface {
 public:
 	virtual int clear() = 0;
+	virtual int pruneExpired(float currTs, float maxAge) { (void)currTs; (void)maxAge; return clear(); }
 	virtual int sizeOfNextRtp() = 0;
 	virtual int seqNrOfNextRtp() = 0;
 	virtual int seqNrOfLastRtp() = 0;
@@ -48,6 +49,7 @@ public:
 	float getDelay(float currTs);
 	bool sendPacket(void** rtpPacket, int& size, uint32_t& ssrc, unsigned short& seqNr, bool& isMark, uint32_t& timeStamp);
 	int clear();
+	int pruneExpired(float currTs, float maxAge) override;
 	int getSizeOfLastFrame() { return sizeOfLastFrame; };
 	void setSizeOfLastFrame(int sz) { sizeOfLastFrame = sz; };
 	void computeSizeOfNextRtp();

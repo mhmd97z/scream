@@ -373,7 +373,9 @@ void ScreamV2Tx::newMediaFrame(uint32_t time_ntp, uint32_t ssrc, int bytesRtp, b
 		* which is necessary to make SCReAM work with audio only
 		*/
 		int sizeOfNextRtp = stream->rtpQueue->sizeOfNextRtp();
-		mss = std::max(mss, sizeOfNextRtp);
+		if (sizeOfNextRtp > 0) {
+			mss = sizeOfNextRtp;
+		}
 		cwndMin = std::max(cwndMinLow, 2 * getMss());
 		cwnd = std::max(cwnd, cwndMin);
 	}
@@ -735,9 +737,14 @@ void ScreamV2Tx::incomingStandardizedFeedback(uint32_t time_ntp,
 		if (isL4s) {
 			/*
 			* L4S mode compute a congestion scaling factor that is dependent on the fraction
-			* of ECN marked packets
+			* of ECN marked packets.
+			* S3: accumulate over at least one full sRtt_ntp (and >= 4 packets unless 2x sRtt
+			* has elapsed at very low bitrates) so immediate 2ms CE feedback (P2) does not
+			* spike fractionMarked = 1/1 = 1.0f on single-packet slices.
 			*/
-			if (time_ntp - lastL4sAlphaUpdateT_ntp > std::min(655u, sRtt_ntp)) { // Update at least every 10ms
+			const uint32_t alphaWin_ntp = std::max(655u, sRtt_ntp);
+			if (time_ntp - lastL4sAlphaUpdateT_ntp > alphaWin_ntp &&
+				(packetsDeliveredThisRtt >= 4 || time_ntp - lastL4sAlphaUpdateT_ntp > 2 * alphaWin_ntp)) {
 				lastL4sAlphaUpdateT_ntp = time_ntp;
 				fractionMarked = 0.0f;
 				if (bytesDeliveredThisRtt > 0) {
@@ -847,11 +854,14 @@ void ScreamV2Tx::incomingStandardizedFeedback(uint32_t time_ntp,
 			virtualL4sAlpha /= std::max(1.0f, float(sRtt_ntp) / kMinCongestionBackOffInterval_ntp);
 		}
 
-		if (sRttShPrev_ntp > sRttSh_ntp && fractionMarked == 1.0f) {
+		if (sRttSh_ntp < (uint32_t)(0.90f * sRttShPrev_ntp) &&
+			queueDelay < queueDelayTarget * 0.5f &&
+			fractionMarked == 1.0f) {
 			/*
 			* L4S marking may have too high marking thresholds, the result is that queues
-			* can become large that CE marking stays too long. This inhibits CE marking if the RTT reduces, which 
-			* is a reasonably safe sign that queues begin to deplete
+			* can become large that CE marking stays too long. This inhibits CE marking only when
+			* sRttSh drops meaningfully (>10%) and queueDelay is well below target (<0.5x),
+			* preventing 15us sRttSh jitter from suppressing ecnCeEvent during active bloat (S3).
 			*/
 			ecnCeEvent = false;
 		}
@@ -1012,6 +1022,16 @@ bool ScreamV2Tx::markAcked(uint32_t time_ntp,
 				qDel = 0;
 			}
 
+			uint32_t rtt = time_ntp - tmp->timeTx_ntp;
+			/*
+			* S2: True one-way queueing delay cannot physically exceed instantaneous RTT
+			* (measured purely on sender CLOCK_MONOTONIC). Clamping qDel <= rtt prevents
+			* uncompensated TX/RX crystal skew from inflating queueDelay > currRtt.
+			*/
+			if (rtt < 1000000u && qDel > rtt) {
+				qDel = rtt;
+			}
+
 			/*
 			* Convert from NTP domain OWD to an OWD in [s]
 			*/
@@ -1024,8 +1044,6 @@ bool ScreamV2Tx::markAcked(uint32_t time_ntp,
 				lastBaseDelayRefreshT_ntp = time_ntp - 3 * sRtt_ntp;
 			}
 
-
-			uint32_t rtt = time_ntp - tmp->timeTx_ntp;
 			currRtt = rtt*ntp2SecScaleFactor;
 
 			if (fp_log && (isUseExtraDetailedLog || isLast || isMark)) {

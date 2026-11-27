@@ -61,7 +61,18 @@ void ScreamRx::Stream::receive(uint32_t time_ntp,
 	*/
 	nRtpSinceLastRtcp++;
 
+	ceBits_ &= 0x03;
+	isEcnCe = (ceBits_ == 0x03);
 	doFlush |= isMarker;
+	/*
+	* L4S / RFC 8888 immediate CE feedback: flush RTCP immediately on CE onset
+	* (rate-limited to >= 2.0 ms = 131 Q16 NTP ticks so multi-packet DL slots
+	* coalesce into a single UL RTCP report while cutting CE notification delay
+	* during low-CQI fades from 20-40 ms down to < 2 ms).
+	*/
+	if (isEcnCe && (lastFeedbackT_ntp == 0 || (uint32_t)(time_ntp - lastFeedbackT_ntp) >= 131)) {
+		doFlush = true;
+	}
 
 	/*
 	* Initialize on first received packet
@@ -423,6 +434,7 @@ void ScreamRx::receive(uint32_t time_ntp,
 		rtcpFbInterval_ntp = uint32_t(65536.0f*kMaxRtcpInterval); // Convert to NTP domain (Q16)
 	}
 
+	uint8_t ecnBits = ceBits & 0x03;
 	if (!streams.empty()) {
 		for (auto it = streams.begin(); it != streams.end(); ++it) {
 			if ((*it)->isMatch(ssrc)) {
@@ -430,7 +442,7 @@ void ScreamRx::receive(uint32_t time_ntp,
 				* Packets for this SSRC received earlier
 				* stream is thus already in list
 				*/
-				(*it)->receive(time_ntp, rtpPacket, size, seqNr, ceBits == 0x03, ceBits, isMark, timeStamp);
+				(*it)->receive(time_ntp, rtpPacket, size, seqNr, ecnBits == 0x03, ecnBits, isMark, timeStamp);
 				return;
 
 			}
@@ -441,7 +453,7 @@ void ScreamRx::receive(uint32_t time_ntp,
 	*/
 	Stream* stream = new Stream(ssrc);
 	stream->nReportedRtpPackets = nReportedRtpPackets;
-	stream->receive(time_ntp, rtpPacket, size, seqNr, ceBits == 0x03, ceBits, isMark, timeStamp);
+	stream->receive(time_ntp, rtpPacket, size, seqNr, ecnBits == 0x03, ecnBits, isMark, timeStamp);
 	streams.push_back(stream);
 }
 

@@ -100,10 +100,12 @@ void RtpQueue::computeSizeOfNextRtp() {
 }
 
 int RtpQueue::sizeOfNextRtp() {
+	std::unique_lock<std::mutex> lock(queue_operation_mutex_);
 	return sizeOfNextRtp_;
 }
 
 int RtpQueue::seqNrOfNextRtp() {
+	std::unique_lock<std::mutex> lock(queue_operation_mutex_);
 	if (!items[tail]->used) {
 		return -1;
 	}
@@ -113,7 +115,8 @@ int RtpQueue::seqNrOfNextRtp() {
 }
 
 int RtpQueue::seqNrOfLastRtp() {
-	if (!items[head]->used) {
+	std::unique_lock<std::mutex> lock(queue_operation_mutex_);
+	if (head < 0 || !items[head]->used) {
 		return -1;
 	}
 	else {
@@ -122,14 +125,17 @@ int RtpQueue::seqNrOfLastRtp() {
 }
 
 int RtpQueue::bytesInQueue() {
+	std::unique_lock<std::mutex> lock(queue_operation_mutex_);
 	return bytesInQueue_;
 }
 
 int RtpQueue::sizeOfQueue() {
+	std::unique_lock<std::mutex> lock(queue_operation_mutex_);
 	return sizeOfQueue_;
 }
 
 float RtpQueue::getDelay(float currTs) {
+	std::unique_lock<std::mutex> lock(queue_operation_mutex_);
 	if (items[tail]->used == false) {
 		return 0;
 	}
@@ -140,8 +146,7 @@ float RtpQueue::getDelay(float currTs) {
 
 bool RtpQueue::sendPacket(void** rtpPacket, int& size, uint32_t& ssrc, unsigned short& seqNr, bool& isMark, uint32_t& timeStamp) {
 	if (sizeOfQueue() > 0) {
-		pop(rtpPacket, size, ssrc, seqNr, isMark, timeStamp);
-		return true;
+		return pop(rtpPacket, size, ssrc, seqNr, isMark, timeStamp);
 	}
 	return false;
 }
@@ -155,10 +160,12 @@ int RtpQueue::clear() {
 	uint32_t ssrc;
 	int freed = 0;
 	int size;
-	void* buf;
+	void* buf = NULL;
 	while (sizeOfQueue() > 0) {
 		bool isMark;
-		pop(&buf, size, ssrc, seqNr, isMark, timeStamp);
+		if (!pop(&buf, size, ssrc, seqNr, isMark, timeStamp)) {
+			break;
+		}
 		if (buf != NULL) {
 			freed++;
 #ifndef IGNORE_PACKET
@@ -167,4 +174,41 @@ int RtpQueue::clear() {
 		}
 	}
 	return (freed);
+}
+
+int RtpQueue::pruneExpired(float currTs, float maxAge) {
+	int freed = 0;
+	for (;;) {
+		void* buf = NULL;
+		uint32_t ssrc = 0;
+		{
+			std::unique_lock<std::mutex> lock(queue_operation_mutex_);
+			if (!items[tail]->used || sizeOfQueue_ <= 0) {
+				break;
+			}
+			if ((currTs - items[tail]->ts) <= maxAge) {
+				break;
+			}
+			int size = items[tail]->size;
+#ifndef IGNORE_PACKET
+			buf = items[tail]->packet;
+#endif
+			ssrc = items[tail]->ssrc;
+			items[tail]->used = false;
+			if (tail == kRtpQueueSize - 1)
+				tail = 0;
+			else
+				tail++;
+			bytesInQueue_ -= size;
+			sizeOfQueue_ -= 1;
+			computeSizeOfNextRtp();
+		}
+		if (buf != NULL) {
+			freed++;
+#ifndef IGNORE_PACKET
+			packet_free(buf, ssrc);
+#endif
+		}
+	}
+	return freed;
 }

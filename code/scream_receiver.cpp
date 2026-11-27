@@ -8,6 +8,11 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/time.h>
+#include <time.h>
+#include <errno.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <iostream>
 #include <fcntl.h>
 #include <unistd.h>
@@ -56,12 +61,22 @@ int ackDiff = -1;
 int nReportedRtpPackets = 64;
 
 char* ifname = 0;
+const char* gateFile = 0;
+long gateOffsetUs = 0;
+bool preNatPunch = false;
 
 int nPrint = 0;
 pthread_mutex_t lock_scream;
 double t0 = 0;
+double t0_mono = 0;
 
 bool ipv6 = false;
+
+static inline double nowMonotonicSec() {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
 
 /*
 * Time in 32 bit NTP format
@@ -69,9 +84,9 @@ bool ipv6 = false;
 * 16 least significant bits is fraction
 */
 uint32_t getTimeInNtp() {
-	struct timeval tp;
-	gettimeofday(&tp, NULL);
-	double time = (tp.tv_sec + tp.tv_usec * 1e-6) - t0;
+	double time = nowMonotonicSec() - t0_mono;
+	if (time < 0.0)
+		time = 0.0;
 	uint64_t ntp64 = uint64_t(time * 65536);
 	uint32_t ntp = 0xFFFFFFFF & (ntp64); // NTP in Q16
 	return ntp;
@@ -108,6 +123,7 @@ uint32_t SSRC = 100; // We don't bother with SSRC yet, this is for experiments o
 
 void* rtcpPeriodicThread(void* arg) {
 	unsigned char buf[BUFSIZE];
+	memset(buf, 0, sizeof(buf));
 	int rtcpSize;
 	uint32_t rtcpFbInterval_ntp = screamRx->getRtcpFbInterval();
 	for (;;) {
@@ -127,22 +143,23 @@ void* rtcpPeriodicThread(void* arg) {
 			cerr << "." << endl;
 		}
 		uint32_t time_ntp = getTimeInNtp();
+		bool sendFeedback = false;
+		pthread_mutex_lock(&lock_scream);
 		rtcpFbInterval_ntp = screamRx->getRtcpFbInterval();
 		if (screamRx->isFeedback(time_ntp) &&
 			(screamRx->checkIfFlushAck() ||
 				(time_ntp - screamRx->getLastFeedbackT() > rtcpFbInterval_ntp))) {
-			pthread_mutex_lock(&lock_scream);
-			bool isFeedback = screamRx->createStandardizedFeedback(getTimeInNtp(), true, buf, rtcpSize);
-			pthread_mutex_unlock(&lock_scream);
-			if (isFeedback) {
-				if (ipv6) {
-					sendto(fd_incoming_rtp, buf, rtcpSize, 0, (struct sockaddr*)&outgoing_rtcp_addr6, sizeof(outgoing_rtcp_addr6));
-				}
-				else {
-					sendto(fd_incoming_rtp, buf, rtcpSize, 0, (struct sockaddr*)&outgoing_rtcp_addr, sizeof(outgoing_rtcp_addr));
-				}
-				lastPunchNatT_ntp = getTimeInNtp();
+			sendFeedback = screamRx->createStandardizedFeedback(getTimeInNtp(), true, buf, rtcpSize);
+		}
+		pthread_mutex_unlock(&lock_scream);
+		if (sendFeedback) {
+			if (ipv6) {
+				sendto(fd_incoming_rtp, buf, rtcpSize, 0, (struct sockaddr*)&outgoing_rtcp_addr6, sizeof(outgoing_rtcp_addr6));
 			}
+			else {
+				sendto(fd_incoming_rtp, buf, rtcpSize, 0, (struct sockaddr*)&outgoing_rtcp_addr, sizeof(outgoing_rtcp_addr));
+			}
+			lastPunchNatT_ntp = getTimeInNtp();
 		}
 		usleep(500);
 	}
@@ -159,12 +176,13 @@ int main(int argc, char* argv[])
 		cerr << "     -ackdiff            set the max distance in received RTPs to send an ACK " << endl;
 		cerr << "     -nreported          set the number of reported RTP packets per ACK " << endl;
 		cerr << "     -if name            bind to specific interface" << endl;
+		cerr << "     -gate path          wait for target epoch in gate file before NAT trigger" << endl;
 		exit(-1);
 	}
 
 	int ix = 1;
 
-	while (strstr(argv[ix], "-")) {
+	while (ix < argc && argv[ix][0] == '-') {
 		if (strstr(argv[ix], "-ipv6")) {
 			ipv6 = true;
 			ix++;
@@ -174,17 +192,41 @@ int main(int argc, char* argv[])
 		if (argc > (ix + 1) && strstr(argv[ix], "-ackdiff")) {
 			ackDiff = atoi(argv[ix + 1]);
 			ix += 2;
+			continue;
 		}
 
 		if (argc > (ix + 1) && strstr(argv[ix], "-nreported")) {
 			nReportedRtpPackets = atoi(argv[ix + 1]);
 			ix += 2;
+			continue;
 		}
 
 		if (argc > (ix + 1) && strstr(argv[ix], "-if")) {
 			ifname = argv[ix + 1];
 			ix += 2;
+			continue;
 		}
+
+		if (argc > (ix + 1) && strcmp(argv[ix], "-gate") == 0) {
+			gateFile = argv[ix + 1];
+			ix += 2;
+			continue;
+		}
+
+		if (argc > (ix + 1) && strcmp(argv[ix], "-offset_us") == 0) {
+			gateOffsetUs = atol(argv[ix + 1]);
+			ix += 2;
+			continue;
+		}
+
+		if (strcmp(argv[ix], "-prenat") == 0) {
+			preNatPunch = true;
+			ix++;
+			continue;
+		}
+
+		cerr << "unexpected arg " << argv[ix] << endl;
+		exit(-1);
 	}
 
 	if (argc > (ix + 1)) {
@@ -197,9 +239,11 @@ int main(int argc, char* argv[])
 	}
 
 
+	memset(buf, 0, sizeof(buf));
 	struct timeval tp;
 	gettimeofday(&tp, NULL);
 	t0 = (tp.tv_sec + tp.tv_usec * 1e-6) - 1e-3;
+	t0_mono = nowMonotonicSec() - 1e-3;
 
 	screamRx = new ScreamRx(10, ackDiff, nReportedRtpPackets);
 
@@ -319,30 +363,112 @@ int main(int argc, char* argv[])
 	uint32_t receivedRtp = 0;
 
 	/*
-	* Send a small packet just to punmax distance in received RTPs to send an ACKch open a hole in the NAT,
+	* Send a small packet just to punch open a hole in the NAT,
 	*  just one single byte will do.
-	* This makes in possible to receive packets on the same port
+	* This makes it possible to receive packets on the same port.
+	* When -gate <path> is provided, block BEFORE this initial sendto so
+	* scream_bw_test_tx -wait is not woken prematurely across UEs.
 	*/
-	if (ipv6) {
-		sendto(fd_incoming_rtp, buf, KEEP_ALIVE_PKT_SIZE, 0, (struct sockaddr*)&outgoing_rtcp_addr6, sizeof(outgoing_rtcp_addr6));
-	}
-	else {
-		sendto(fd_incoming_rtp, buf, KEEP_ALIVE_PKT_SIZE, 0, (struct sockaddr*)&outgoing_rtcp_addr, sizeof(outgoing_rtcp_addr));
+	if (gateFile != 0) {
+		int fd_host_trig = -1;
+		if (preNatPunch) {
+			fd_host_trig = socket(ipv6 ? AF_INET6 : AF_INET, SOCK_DGRAM, 0);
+			const char punch_msg[5] = {'P', 'U', 'N', 'C', 'H'};
+			if (ipv6) {
+				sendto(fd_incoming_rtp, punch_msg, 5, 0, (struct sockaddr*)&outgoing_rtcp_addr6, sizeof(outgoing_rtcp_addr6));
+			} else {
+				sendto(fd_incoming_rtp, punch_msg, 5, 0, (struct sockaddr*)&outgoing_rtcp_addr, sizeof(outgoing_rtcp_addr));
+			}
+		}
+		double target_ts = 0.0;
+		for (int poll_i = 0; poll_i < 12000; poll_i++) {
+			if (preNatPunch && poll_i > 0 && (poll_i % 50) == 0) {
+				const char punch_msg[5] = {'P', 'U', 'N', 'C', 'H'};
+				if (ipv6) {
+					sendto(fd_incoming_rtp, punch_msg, 5, 0, (struct sockaddr*)&outgoing_rtcp_addr6, sizeof(outgoing_rtcp_addr6));
+				} else {
+					sendto(fd_incoming_rtp, punch_msg, 5, 0, (struct sockaddr*)&outgoing_rtcp_addr, sizeof(outgoing_rtcp_addr));
+				}
+			}
+			FILE* gf = fopen(gateFile, "r");
+			if (gf != NULL) {
+				if (fscanf(gf, "%lf", &target_ts) == 1 && target_ts > 1e9) {
+					fclose(gf);
+					break;
+				}
+				fclose(gf);
+				target_ts = 0.0;
+			}
+			usleep(10000);
+		}
+		if (target_ts > 1e9) {
+			if (preNatPunch) {
+				const char punch_msg[5] = {'P', 'U', 'N', 'C', 'H'};
+				if (ipv6) {
+					sendto(fd_incoming_rtp, punch_msg, 5, 0, (struct sockaddr*)&outgoing_rtcp_addr6, sizeof(outgoing_rtcp_addr6));
+				} else {
+					sendto(fd_incoming_rtp, punch_msg, 5, 0, (struct sockaddr*)&outgoing_rtcp_addr, sizeof(outgoing_rtcp_addr));
+				}
+			}
+			double wake_ts = target_ts + (double)gateOffsetUs * 1e-6;
+			struct timespec ts_target;
+			double sec_part = floor(wake_ts);
+			ts_target.tv_sec = (time_t)sec_part;
+			ts_target.tv_nsec = (long)((wake_ts - sec_part) * 1e9);
+			if (ts_target.tv_nsec >= 1000000000L) {
+				ts_target.tv_sec += 1;
+				ts_target.tv_nsec -= 1000000000L;
+			} else if (ts_target.tv_nsec < 0) {
+				ts_target.tv_nsec = 0;
+			}
+			while (clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &ts_target, NULL) == EINTR) {
+			}
+		}
+		struct timeval tp_fire;
+		gettimeofday(&tp_fire, NULL);
+		double fire_ts = tp_fire.tv_sec + tp_fire.tv_usec * 1e-6;
+		t0 = fire_ts - 1e-3;
+		t0_mono = nowMonotonicSec() - 1e-3;
+		fprintf(stderr, "SCREAM_RX_GATE_FIRE_TS=%.6f target=%.6f offset_us=%ld\n", fire_ts, target_ts, gateOffsetUs);
+		fflush(stderr);
+		const char start_msg[5] = {'S', 'T', 'A', 'R', 'T'};
+		for (int b = 0; b < 3; b++) {
+			if (b > 0) usleep(2000);
+			if (preNatPunch && fd_host_trig >= 0) {
+				if (ipv6) {
+					sendto(fd_host_trig, start_msg, 5, 0, (struct sockaddr*)&outgoing_rtcp_addr6, sizeof(outgoing_rtcp_addr6));
+				} else {
+					sendto(fd_host_trig, start_msg, 5, 0, (struct sockaddr*)&outgoing_rtcp_addr, sizeof(outgoing_rtcp_addr));
+				}
+			}
+			if (ipv6) {
+				sendto(fd_incoming_rtp, buf, KEEP_ALIVE_PKT_SIZE, 0, (struct sockaddr*)&outgoing_rtcp_addr6, sizeof(outgoing_rtcp_addr6));
+			} else {
+				sendto(fd_incoming_rtp, buf, KEEP_ALIVE_PKT_SIZE, 0, (struct sockaddr*)&outgoing_rtcp_addr, sizeof(outgoing_rtcp_addr));
+			}
+		}
+		if (fd_host_trig >= 0) {
+			close(fd_host_trig);
+		}
+	} else {
+		if (ipv6) {
+			sendto(fd_incoming_rtp, buf, KEEP_ALIVE_PKT_SIZE, 0, (struct sockaddr*)&outgoing_rtcp_addr6, sizeof(outgoing_rtcp_addr6));
+		}
+		else {
+			sendto(fd_incoming_rtp, buf, KEEP_ALIVE_PKT_SIZE, 0, (struct sockaddr*)&outgoing_rtcp_addr, sizeof(outgoing_rtcp_addr));
+		}
 	}
 	lastPunchNatT_ntp = getTimeInNtp();
-
-	pthread_t rtcp_thread;
-	pthread_create(&rtcp_thread, NULL, rtcpPeriodicThread, (void*)"Periodic RTCP thread...");
 
 	uint16_t lastSn = 0;
 	pthread_mutex_init(&lock_scream, NULL);
 
+	pthread_t rtcp_thread;
+	pthread_create(&rtcp_thread, NULL, rtcpPeriodicThread, (void*)"Periodic RTCP thread...");
+
 
 #define MAX_CTRL_SIZE 8192
 #define MAX_BUF_SIZE 65536
-
-	int* ecnptr;
-	unsigned char received_ecn;
 
 	struct msghdr rcv_msg;
 	struct iovec rcv_iov[1];
@@ -359,18 +485,23 @@ int main(int argc, char* argv[])
 	rcv_msg.msg_iovlen = 1;
 	rcv_msg.msg_control = rcv_ctrl_data;
 	rcv_msg.msg_controllen = MAX_CTRL_SIZE;
+	rcv_msg.msg_flags = 0;
 
 	for (;;) {
 		//usleep(1);
 		/*
-		* Wait for incoing RTP packet, this call can be blocking
+		* Wait for incoming RTP packet, this call can be blocking
 		*/
 
 		/*
-		* Extract ECN bits
+		* Extract ECN bits (reset msg_controllen before every recvmsg call so the
+		* kernel never truncates ancillary IP_TOS / IPV6_TCLASS control messages)
 		*/
-		unsigned char received_ecn;
+		unsigned char received_ecn = 0;
 #ifdef ECN_CAPABLE
+		rcv_msg.msg_control = rcv_ctrl_data;
+		rcv_msg.msg_controllen = MAX_CTRL_SIZE;
+		rcv_msg.msg_flags = 0;
 		int recvlen = recvmsg(fd_incoming_rtp, &rcv_msg, 0);
 		if (recvlen == -1) {
 			perror("recvmsg()");
@@ -386,13 +517,13 @@ int main(int argc, char* argv[])
 				if (ipv6) {
 					if (cmptr->cmsg_level == IPPROTO_IPV6 && cmptr->cmsg_type == IPV6_TCLASS) {
 						ecnptr = (int*)CMSG_DATA(cmptr);
-						received_ecn = *ecnptr;
+						received_ecn = (unsigned char)((*ecnptr) & 0x03);
 					}
 				}
 				else {
 					if (cmptr->cmsg_level == IPPROTO_IP && cmptr->cmsg_type == IP_TOS) {
 						ecnptr = (int*)CMSG_DATA(cmptr);
-						received_ecn = *ecnptr;
+						received_ecn = (unsigned char)((*ecnptr) & 0x03);
 					}
 				}
 			}
@@ -417,18 +548,8 @@ int main(int argc, char* argv[])
 				cout << s << endl;
 			}
 			else {
-				if (time_ntp - last_received_time_ntp > 2 * 65536) { // 2 sec in Q16
-					/*
-					* It's been more than 2 seconds since we last received an RTP packet
-					*  let's reset everything to be on the safe side
-					*/
-					receivedRtp = 0;
-					delete screamRx;
-					screamRx = new ScreamRx(10, ackDiff, nReportedRtpPackets);
-					cerr << "Receiver state reset due to idle input" << endl;
-				}
+				bool resetState = (time_ntp - last_received_time_ntp > 2 * 65536); // 2 sec in Q16
 				last_received_time_ntp = time_ntp;
-				receivedRtp++;
 				/*
 				* Parse RTP header
 				*/
@@ -436,15 +557,26 @@ int main(int argc, char* argv[])
 				uint32_t ts;
 				parseRtp(buf, &seqNr, &ts);
 				bool isMark = (buf[1] & 0x80) != 0;
-				uint16_t diff = seqNr - lastSn;
-				if (diff > 1) {
-					fprintf(stderr, "Packet(s) lost or reordered : %5d was received, previous rcvd is %5d \n", seqNr, lastSn);
+				if (!resetState) {
+					uint16_t diff = seqNr - lastSn;
+					if (diff > 1) {
+						fprintf(stderr, "Packet(s) lost or reordered : %5d was received, previous rcvd is %5d \n", seqNr, lastSn);
+					}
 				}
 				lastSn = seqNr;
 				/*
-				* Generate RTCP feedback
+				* Update receiver state & generate immediate RTCP feedback under lock_scream
 				*/
+				int rtcpSize = 0;
+				bool isFeedback = false;
 				pthread_mutex_lock(&lock_scream);
+				if (resetState) {
+					receivedRtp = 0;
+					delete screamRx;
+					screamRx = new ScreamRx(10, ackDiff, nReportedRtpPackets);
+					cerr << "Receiver state reset due to idle input" << endl;
+				}
+				receivedRtp++;
 #ifdef TEST_L4S
 				if (received_ecn == 0x1) {
 					pMarkCarry += PMARK;
@@ -454,41 +586,39 @@ int main(int argc, char* argv[])
 					}
 				}
 #endif
-				screamRx->receive(getTimeInNtp(), 0, SSRC, recvlen, seqNr, received_ecn, isMark,ts);
+				uint32_t rx_ntp = getTimeInNtp();
+				screamRx->receive(rx_ntp, 0, SSRC, recvlen, seqNr, received_ecn, isMark, ts);
+				bool needFlush = screamRx->checkIfFlushAck() || isMark;
+				if (needFlush) {
+					isFeedback = screamRx->createStandardizedFeedback(getTimeInNtp(), true, buf_rtcp, rtcpSize);
+				}
 				pthread_mutex_unlock(&lock_scream);
 
-				if (screamRx->checkIfFlushAck() || isMark) {
-					pthread_mutex_lock(&lock_scream);
-					int rtcpSize;
-					bool isFeedback = screamRx->createStandardizedFeedback(getTimeInNtp(), isMark, buf_rtcp, rtcpSize);
-					pthread_mutex_unlock(&lock_scream);
-					if (isFeedback) {
+				if (isFeedback) {
+					if (ipv6) {
+						sendto(fd_incoming_rtp, buf_rtcp, rtcpSize, 0, (struct sockaddr*)&outgoing_rtcp_addr6, sizeof(outgoing_rtcp_addr6));
+					}
+					else {
+						sendto(fd_incoming_rtp, buf_rtcp, rtcpSize, 0, (struct sockaddr*)&outgoing_rtcp_addr, sizeof(outgoing_rtcp_addr));
+					}
+					for (;;) {
+						bool isFeedbackOoo = false;
+						pthread_mutex_lock(&lock_scream);
+						if (screamRx->isOooDetected()) {
+							isFeedbackOoo = screamRx->createStandardizedFeedbackOoo(getTimeInNtp(), false, buf_rtcp, rtcpSize);
+						}
+						pthread_mutex_unlock(&lock_scream);
+						if (!isFeedbackOoo) {
+							break;
+						}
 						if (ipv6) {
 							sendto(fd_incoming_rtp, buf_rtcp, rtcpSize, 0, (struct sockaddr*)&outgoing_rtcp_addr6, sizeof(outgoing_rtcp_addr6));
 						}
 						else {
 							sendto(fd_incoming_rtp, buf_rtcp, rtcpSize, 0, (struct sockaddr*)&outgoing_rtcp_addr, sizeof(outgoing_rtcp_addr));
-
 						}
-				        while (screamRx->isOooDetected()) {
-					        /*
-					        * OOO RTP detected, additional "transmission" of RTCP
-					        */
-				        	pthread_mutex_lock(&lock_scream);					           
-				        	bool isFeedbackOoo = screamRx->createStandardizedFeedbackOoo(getTimeInNtp(), false, buf_rtcp, rtcpSize);
-				        	pthread_mutex_unlock(&lock_scream);
-				        	if (isFeedbackOoo) {
-				        		if (ipv6) {
-				        			sendto(fd_incoming_rtp, buf_rtcp, rtcpSize, 0, (struct sockaddr*)&outgoing_rtcp_addr6, sizeof(outgoing_rtcp_addr6));
-				        		}
-				        		else {
-				        			sendto(fd_incoming_rtp, buf_rtcp, rtcpSize, 0, (struct sockaddr*)&outgoing_rtcp_addr, sizeof(outgoing_rtcp_addr));
-
-				        		}
-				        	}
-				        }
-						lastPunchNatT_ntp = getTimeInNtp();
 					}
+					lastPunchNatT_ntp = getTimeInNtp();
 				}
 			}
 		}

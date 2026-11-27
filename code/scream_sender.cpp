@@ -14,6 +14,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <time.h>
+#include <errno.h>
 #include <signal.h>
 #include <sys/timerfd.h>
 struct itimerval timer;
@@ -135,23 +137,33 @@ float randRate = 0.0f;
 bool ipv6 = false;
 
 double t0 = 0;
-/*
-long getTimeInUs(){
-struct timeval tp;
-gettimeofday(&tp, NULL);
-long us = tp.tv_sec * 1000000 + tp.tv_usec;
-return us;
+double t0_mono = 0;
+
+static inline double nowMonotonicSec() {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
-*/
+
+static inline void sleepMonotonicUs(long usec) {
+	if (usec <= 0)
+		return;
+	struct timespec req, rem;
+	req.tv_sec = usec / 1000000L;
+	req.tv_nsec = (usec % 1000000L) * 1000L;
+	while (clock_nanosleep(CLOCK_MONOTONIC, 0, &req, &rem) == EINTR) {
+		req = rem;
+	}
+}
 
 void packet_free(void* buf, uint32_t ssrc) {
 	free(buf);
 }
 
 uint32_t getTimeInNtp() {
-	struct timeval tp;
-	gettimeofday(&tp, NULL);
-	double time = tp.tv_sec + tp.tv_usec * 1e-6 - t0;
+	double time = nowMonotonicSec() - t0_mono;
+	if (time < 0.0)
+		time = 0.0;
 	uint64_t ntp64 = uint64_t(time * 65536.0);
 	uint32_t ntp = 0xFFFFFFFF & ntp64;
 	return ntp;
@@ -215,10 +227,8 @@ void* transmitRtpThread(void* arg) {
 	char buf[2000];
 	uint32_t time_ntp = getTimeInNtp();
 	float retVal = 0.0f;
-	struct timeval start, end;
-	useconds_t diff = 0;
 
-	accumulatedPaceTime = 0.0;
+	accumulatedPaceTime = 0.0f;
 	int nTx = 0;
 
 	for (;;) {
@@ -227,44 +237,49 @@ void* transmitRtpThread(void* arg) {
 		}
 		retVal = -1.0f;
 
-		while (retVal == -1.0f) {
+		while (retVal == -1.0f && !stopThread) {
 			pthread_mutex_lock(&lock_scream);
 			time_ntp = getTimeInNtp();
 			retVal = screamTx->isOkToTransmit(time_ntp, SSRC);
 			pthread_mutex_unlock(&lock_scream);
 			if (retVal == -1.0f) {
-				usleep(10);
+				sleepMonotonicUs(25);
 				nTx = 0;
 			}
-
 		}
-		
+		if (stopThread) {
+			return NULL;
+		}
 
-		
-		if (accumulatedPaceTime > minPaceIntervalUs * 1e-6) {
-			diff = 100;
-			if (accumulatedPaceTime > 1.1 * minPaceIntervalUs * 1e-6)
-				usleep(std::max(10, (int)(accumulatedPaceTime * 1e6 - diff)));
-			else
-				usleep(std::max(10u, minPaceIntervalUs - diff));
-			gettimeofday(&end, 0);
-			diff = end.tv_usec - start.tv_usec;
-			accumulatedPaceTime = 0.0f;
+		if (accumulatedPaceTime > minPaceIntervalUs * 1e-6f) {
+			double target_sleep_s = (accumulatedPaceTime > 1.1f * minPaceIntervalUs * 1e-6f)
+				? (double)accumulatedPaceTime
+				: (double)minPaceIntervalUs * 1e-6;
+			long sleep_us = std::max(10L, (long)(target_sleep_s * 1e6));
+			double before_s = nowMonotonicSec();
+			sleepMonotonicUs(sleep_us);
+			double elapsed_s = nowMonotonicSec() - before_s;
+			accumulatedPaceTime = std::max(0.0f, (float)(accumulatedPaceTime - elapsed_s));
 			nTx = 0;
 		}
 
 
 		time_ntp = getTimeInNtp();
-		void* buf;
-		uint32_t ssrc_unused;
+		void* buf = NULL;
+		uint32_t ssrc_unused = 0;
 
 		pthread_mutex_lock(&lock_rtp_queue);
-		float rtpQueueDelay = 0.0f;
-		rtpQueueDelay = rtpQueue->getDelay((time_ntp) / 65536.0f);
-		rtpQueue->pop(&buf, size, ssrc_unused, seqNr, isMark, ts);
-		sendPacket(buf, size);
-		nTx++;
+		float rtpQueueDelay = rtpQueue->getDelay((time_ntp) / 65536.0f);
+		bool popped = rtpQueue->pop(&buf, size, ssrc_unused, seqNr, isMark, ts);
+		if (popped && buf != NULL) {
+			sendPacket(buf, size);
+			nTx++;
+		}
 		pthread_mutex_unlock(&lock_rtp_queue);
+
+		if (!popped || buf == NULL) {
+			continue;
+		}
 
 		packet_free(buf, SSRC);
 		buf = NULL;
@@ -346,6 +361,7 @@ void* createRtpThread(void* arg) {
 		if (stopThread) {
 			return NULL;
 		}
+		pthread_mutex_lock(&lock_scream);
 		uint32_t time_ntp = getTimeInNtp();
 
 		uint32_t ts = (uint32_t)(time_ntp / 65536.0 * 90000);
@@ -354,6 +370,7 @@ void* createRtpThread(void* arg) {
 		mtu = screamTx->getRecommendedMss(time_ntp);
 
 		screamTx->setCwndMinLow((mtu+12)*2);
+		pthread_mutex_unlock(&lock_scream);
 
 		float randVal = float(rand()) / RAND_MAX - 0.5;
 		int bytes = (int)(rateTx / FPS / 8 * (1.0 + randVal * randRate));
@@ -442,7 +459,7 @@ void* readRtcpThread(void* arg) {
 		}
 		if (stopThread)
 			return NULL;
-		if (recvlen > KEEP_ALIVE_PKT_SIZE) {
+		if (recvlen >= 8) {
 			pthread_mutex_lock(&lock_scream);
 			uint32_t time_ntp = getTimeInNtp(); // We need time in microseconds, roughly ms granularity is OK
 			char s[100];
@@ -569,6 +586,10 @@ int setup() {
 	}
 	int tmp = 0;
 #endif
+	return 1;
+}
+
+int setupScream() {
 	char buf[10];
 	if (fixedRate > 0) {
 		screamTx = new ScreamV2Tx(
@@ -628,7 +649,7 @@ int setup() {
 			minRate * 1000,
 			initRate * 1000,
 			maxRate * 1000,
-			0.2f,
+			0.12f,
 			false,
 			hysteresis);
 	}
@@ -646,10 +667,12 @@ void stopAll(int signum)
 
 int main(int argc, char* argv[]) {
 
+    srand(1);
     mtuList[0] = mtu;
 	struct timeval tp;
 	gettimeofday(&tp, NULL);
 	t0 = tp.tv_sec + tp.tv_usec * 1e-6 - 1e-3;
+	t0_mono = nowMonotonicSec() - 1e-3;
 	lastT_ntp = getTimeInNtp();
 
 	/*
@@ -994,19 +1017,11 @@ int main(int argc, char* argv[]) {
 	if (setup() == 0)
 		return 0;
 
-	if (logFile && !append && itemlist) {
-		fprintf(fp_log, "%s\n", screamTx->getDetailedLogItemList());
-	}
-
 	struct sigaction action;
 	memset(&action, 0, sizeof(struct sigaction));
 	action.sa_handler = stopAll;
 	sigaction(SIGTERM, &action, NULL);
 	sigaction(SIGINT, &action, NULL);
-
-	screamTx->setDetailedLogFp(fp_log);
-	screamTx->useExtraDetailedLog(detailed);
-	screamTx->setTxRxLogFp(fp_txrxlog);
 
 	pthread_mutex_init(&lock_scream, NULL);
 	pthread_mutex_init(&lock_rtp_queue, NULL);
@@ -1029,16 +1044,42 @@ int main(int argc, char* argv[]) {
 		cerr << "Waiting for trigger from receiver on UDP/" << DECODER_PORT << " ..." << endl;
 		char trig[64];
 		struct sockaddr_storage trigSrc;
+		struct sockaddr_storage prenatSrc;
+		bool hasPrenat = false;
+		memset(&prenatSrc, 0, sizeof(prenatSrc));
 		while (!stopThread) {
 			socklen_t slen = sizeof(trigSrc);
 			ssize_t r = recvfrom(fd_outgoing_rtp, trig, sizeof(trig), 0,
 			                     (struct sockaddr*)&trigSrc, &slen);
-			if (r >= 1) break;
+			if (r == 5 && memcmp(trig, "PUNCH", 5) == 0) {
+				prenatSrc = trigSrc;
+				hasPrenat = true;
+				continue;
+			}
+			if (r >= 1) {
+				if (hasPrenat) {
+					trigSrc = prenatSrc;
+				}
+				break;
+			}
 		}
 		if (stopThread) {
 			cerr << "Interrupted while waiting for trigger." << endl;
 			return 0;
 		}
+		struct timeval tp_trig;
+		gettimeofday(&tp_trig, NULL);
+		double tx_start_epoch = tp_trig.tv_sec + tp_trig.tv_usec * 1e-6;
+		t0 = tx_start_epoch - 1e-3;
+		t0_mono = nowMonotonicSec() - 1e-3;
+		srand(1u + (unsigned)(DECODER_PORT & 0xFFFF));
+		uint32_t init_ntp = getTimeInNtp();
+		lastT_ntp = init_ntp;
+		lastLogT_ntp = init_ntp;
+		lastLogTv_ntp = init_ntp;
+		lastKeyFrameT_ntp = init_ntp;
+		fprintf(stderr, "SCREAM_TX_START_TS=%.6f\n", tx_start_epoch);
+		fflush(stderr);
 
 		char ipstr[INET6_ADDRSTRLEN] = {0};
 		int srcPort = 0;
@@ -1059,6 +1100,18 @@ int main(int argc, char* argv[]) {
 		cerr << "Trigger received from " << ipstr << ":" << srcPort
 		     << " - using as decoder address. Starting transmission." << endl;
 	}
+
+	/* Construct ScreamV2Tx and RtpQueue AFTER the -wait barrier latches t0_mono
+	 * so internal congestion-control and pacing state always starts at t = 1 ms. */
+	if (setupScream() == 0)
+		return 0;
+
+	if (logFile && !append && itemlist) {
+		fprintf(fp_log, "%s\n", screamTx->getDetailedLogItemList());
+	}
+	screamTx->setDetailedLogFp(fp_log);
+	screamTx->useExtraDetailedLog(detailed);
+	screamTx->setTxRxLogFp(fp_txrxlog);
 
 	/* Create RTP thread */
 	pthread_create(&create_rtp_thread, NULL, createRtpThread, (void*)"Create RTP thread...");
@@ -1089,9 +1142,12 @@ int main(int argc, char* argv[]) {
 				else {
 					float time_s = time_ntp / 65536.0f;
 					char s[500];
+					pthread_mutex_lock(&lock_scream);
 					screamTx->getStatistics(time_s, s);
+					int cur_mtu = mtu;
+					pthread_mutex_unlock(&lock_scream);
 
-					cout << s << ", MTU = " << mtu <<endl;
+					cout << s << ", MTU = " << cur_mtu <<endl;
 				}
 				lastLogT_ntp = time_ntp;
 			}
@@ -1100,7 +1156,9 @@ int main(int argc, char* argv[]) {
 					float time_s = time_ntp / 65536.0f;
 					char s[3000];
 					char s1[500];
+					pthread_mutex_lock(&lock_scream);
 					screamTx->getVeryShortLog(time_s, s1);
+					pthread_mutex_unlock(&lock_scream);
 
 					sprintf(s, "%8.3f, %s ", time_s, s1);
 
@@ -1126,5 +1184,7 @@ int main(int argc, char* argv[]) {
 		fclose(fp_log);
 	if (fp_txrxlog)
 		fclose(fp_txrxlog);
+	pthread_mutex_lock(&lock_scream);
 	screamTx->printFinalSummary();
+	pthread_mutex_unlock(&lock_scream);
 }

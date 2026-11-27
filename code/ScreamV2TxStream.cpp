@@ -290,29 +290,33 @@ void ScreamV2Tx::Stream::updateTargetBitrate(uint32_t time_ntp) {
 		lastBitrateAdjustT_ntp = time_ntp;
 	}
 
-	float rtpQueueDelay = rtpQueue->getDelay(time_ntp * ntp2SecScaleFactor);
+	float currTs_s = time_ntp * ntp2SecScaleFactor;
+	float rtpQueueDelay = rtpQueue->getDelay(currTs_s);
 	if (rtpQueueDelay > maxRtpQueueDelay &&
-		(time_ntp - lastRtpQueueDiscardT_ntp > kMinRtpQueueDiscardInterval_ntp)) {
+		(time_ntp - initTime_ntp > kMinRtpQueueDiscardInterval_ntp)) {
 		/*
-		* RTP queue is cleared as it is becoming too large,
-		* Function is however disabled initially as there is no reliable estimate of the
-		* throughput in the initial phase.
+		* S4: Evict only expired head RTP packets (age > maxRtpQueueDelay) rather than
+		* wiping the entire RTP queue at once on a discontinuous 200ms cliff.
+		* Rate-limit lossEpoch / IDR-refresh signalling to kMinRtpQueueDiscardInterval_ntp.
 		*/
 		int seqNrOfNextRtp = rtpQueue->seqNrOfNextRtp();
 		int seqNrOfLastRtp = rtpQueue->seqNrOfLastRtp();
 		int pak_diff = (seqNrOfLastRtp == -1) ? -1 : ((seqNrOfLastRtp >= hiSeqTx) ? (seqNrOfLastRtp - hiSeqTx) : seqNrOfLastRtp + 0xffff - hiSeqTx);
 
-		int cur_cleared = rtpQueue->clear();
-		std::cerr << parent->logTag << " rtpQueueDelay " << rtpQueueDelay << " too large 1 " << time_ntp / 65536.0f << " RTP queue " << cur_cleared <<
-			" packets discarded for SSRC " << ssrc << " hiSeqTx " << hiSeqTx << " hiSeqAckendl " << hiSeqAck <<
-			" seqNrOfNextRtp " << seqNrOfNextRtp << " seqNrOfLastRtp " << seqNrOfLastRtp << " diff " << pak_diff << std::endl;
-		cleared += cur_cleared;
-		rtpQueueDiscard = true;
-		lossEpoch = true;
-
-		lastRtpQueueDiscardT_ntp = time_ntp;
-		targetRateScale = 1.0;
-		rtpQueueDelay = rtpQueue->getDelay(time_ntp * ntp2SecScaleFactor);
+		int cur_cleared = rtpQueue->pruneExpired(currTs_s, maxRtpQueueDelay);
+		if (cur_cleared > 0) {
+			cleared += cur_cleared;
+			if (time_ntp - lastRtpQueueDiscardT_ntp > kMinRtpQueueDiscardInterval_ntp) {
+				std::cerr << parent->logTag << " rtpQueueDelay " << rtpQueueDelay << " head-drop " << currTs_s << " RTP queue " << cur_cleared <<
+					" packets discarded for SSRC " << ssrc << " hiSeqTx " << hiSeqTx << " hiSeqAckendl " << hiSeqAck <<
+					" seqNrOfNextRtp " << seqNrOfNextRtp << " seqNrOfLastRtp " << seqNrOfLastRtp << " diff " << pak_diff << std::endl;
+				rtpQueueDiscard = true;
+				lossEpoch = true;
+				lastRtpQueueDiscardT_ntp = time_ntp;
+				targetRateScale = 1.0;
+			}
+			rtpQueueDelay = rtpQueue->getDelay(currTs_s);
+		}
 	}
 
 	/*
